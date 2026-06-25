@@ -146,8 +146,8 @@ impl Attention {
             Some(mask) => attn_weights.broadcast_add(mask)?,
         };
         // The original implementation upcasts to f32 but candle_nn::ops::softmax should handle this properly.
-        let attn_weights = candle_nn::ops::softmax_last_dim(&attn_weights)?;
-        let attn_outputs = attn_weights
+        let attn_scores = candle_nn::ops::softmax_last_dim(&attn_weights)?;
+        let attn_outputs = attn_scores
             .matmul(&value_states)?
             .transpose(1, 2)?
             .reshape((batch_size, q_len, ()))?
@@ -165,11 +165,15 @@ struct Mlp {
 }
 
 impl Mlp {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+    fn new(cfg: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
         let hidden_size = cfg.hidden_size();
         let intermediate_size = cfg.intermediate_size();
-        let fc1 = candle_nn::linear(hidden_size, intermediate_size, vb.pp("fc1"))?;
-        let fc2 = candle_nn::linear(intermediate_size, hidden_size, vb.pp("fc2"))?;
+        let fc1_weight = vb.pp("fc1").get((intermediate_size, hidden_size), "weight")?;
+        let fc1_bias = vb.pp("fc1").get(intermediate_size, "bias")?;
+        let fc1 = Linear::new(fc1_weight, Some(fc1_bias), None);
+        let fc2_weight = vb.pp("fc2").get((intermediate_size, hidden_size), "weight")?;
+        let fc2_bias = vb.pp("fc2").get(hidden_size, "bias")?;
+        let fc2 = Linear::new(fc2_weight, Some(fc2_bias), None);
         Ok(Self {
             fc1,
             fc2,
