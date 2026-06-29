@@ -85,7 +85,7 @@ pub struct SiglipTextConfig {
     pub hidden_act: HiddenAct,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Attention {
     q_proj: Linear,
     k_proj: Linear,
@@ -97,8 +97,8 @@ struct Attention {
 }
 
 impl Attention {
-    fn new(cfg: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
-        let embed_dim = cfg.hidden_size();
+    fn new(config: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
+        let embed_dim = config.hidden_size;
 
         let query_weight = vb.pp("q_proj").get((embed_dim, embed_dim), "weight")?;
         let query_bias = vb.pp("q_proj").get(embed_dim, "bias")?;
@@ -116,7 +116,7 @@ impl Attention {
         let out_bias = vb.pp("out_proj").get(embed_dim, "bias")?;
         let out_proj = Linear::new(out_weight, Some(out_bias), None);
 
-        let num_heads = cfg.num_attention_heads();
+        let num_heads = config.num_attention_heads;
         let head_dim = embed_dim / num_heads;
         Ok(Self {
             q_proj,
@@ -131,9 +131,9 @@ impl Attention {
 
     fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let (batch_size, q_len, _) = xs.dims3()?;
-        let query_states = xs.apply(&self.q_proj)?;
-        let key_states = xs.apply(&self.k_proj)?;
-        let value_states = xs.apply(&self.v_proj)?;
+        let query_states = self.q_proj.forward(xs)?;
+        let key_states = self.k_proj.forward(xs)?;
+        let value_states = self.v_proj.forward(xs)?;
 
         let shape = (batch_size, q_len, self.num_heads, self.head_dim);
         let query_states = query_states.reshape(shape)?.transpose(1, 2)?.contiguous()?;
@@ -150,48 +150,54 @@ impl Attention {
         let attn_outputs = attn_scores
             .matmul(&value_states)?
             .transpose(1, 2)?
-            .reshape((batch_size, q_len, ()))?
-            .apply(&self.out_proj)?;
+            .reshape((batch_size, q_len, ()))?;
+        let attn_outputs = self.out_proj.forward(&attn_outputs)?;
         Ok(attn_outputs)
     }
 }
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/modeling_siglip.py#L599
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Mlp {
     fc1: Linear,
     fc2: Linear,
-    activation_fn: candle_nn::Activation,
+    activation_fn: HiddenAct,
 }
 
 impl Mlp {
-    fn new(cfg: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
-        let hidden_size = cfg.hidden_size();
-        let intermediate_size = cfg.intermediate_size();
-        let fc1_weight = vb.pp("fc1").get((intermediate_size, hidden_size), "weight")?;
+    fn new(config: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let intermediate_size = config.intermediate_size;
+        let fc1_weight = vb
+            .pp("fc1")
+            .get((intermediate_size, hidden_size), "weight")?;
         let fc1_bias = vb.pp("fc1").get(intermediate_size, "bias")?;
         let fc1 = Linear::new(fc1_weight, Some(fc1_bias), None);
-        let fc2_weight = vb.pp("fc2").get((intermediate_size, hidden_size), "weight")?;
+        let fc2_weight = vb
+            .pp("fc2")
+            .get((hidden_size, intermediate_size), "weight")?;
         let fc2_bias = vb.pp("fc2").get(hidden_size, "bias")?;
+        // TODO: pass hidden_act directly to fc1
         let fc2 = Linear::new(fc2_weight, Some(fc2_bias), None);
         Ok(Self {
             fc1,
             fc2,
-            activation_fn: cfg.hidden_act(),
+            activation_fn: config.hidden_act.clone(),
         })
     }
 }
 
 impl Module for Mlp {
     fn forward(&self, xs: &candle::Tensor) -> Result<candle::Tensor> {
-        xs.apply(&self.fc1)?
-            .apply(&self.activation_fn)?
-            .apply(&self.fc2)
+        let xs = self.fc1.forward(&xs)?;
+        let xs = self.activation_fn.forward(&xs)?;
+        let xs = self.fc2.forward(&xs)?;
+        Ok(xs)
     }
 }
 
 // https://github.com/huggingface/transformers/blob/2e24ee4dfa39cc0bc264b89edbccc373c8337086/src/transformers/models/siglip/modeling_siglip.py#L614
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct EncoderLayer {
     self_attn: Attention,
     layer_norm1: LayerNorm,
@@ -200,13 +206,16 @@ struct EncoderLayer {
 }
 
 impl EncoderLayer {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
-        let hidden_size = cfg.hidden_size();
-        let layer_norm_eps = cfg.layer_norm_eps();
-        let self_attn = Attention::new(cfg, vb.pp("self_attn"))?;
-        let layer_norm1 = layer_norm(hidden_size, layer_norm_eps, vb.pp("layer_norm1"))?;
-        let mlp = Mlp::new(cfg, vb.pp("mlp"))?;
-        let layer_norm2 = layer_norm(hidden_size, layer_norm_eps, vb.pp("layer_norm2"))?;
+    fn new(config: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
+        let hidden_size = config.hidden_size;
+        let layer_norm_eps = config.layer_norm_eps;
+        let self_attn = Attention::new(config, vb.pp("self_attn"))?;
+
+        let layer_norm1 =
+            LayerNorm::load(vb.pp("layer_norm1"), hidden_size, layer_norm_eps as f32)?;
+        let mlp = Mlp::new(config, vb.pp("mlp"))?;
+        let layer_norm2 =
+            LayerNorm::load(vb.pp("layer_norm2"), hidden_size, layer_norm_eps as f32)?;
         Ok(Self {
             self_attn,
             layer_norm1,
@@ -217,27 +226,28 @@ impl EncoderLayer {
 
     fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let residual = xs;
-        let xs = xs.apply(&self.layer_norm1)?;
+        let xs = self.layer_norm1.forward(&xs, None)?;
         let xs = self.self_attn.forward(&xs, attention_mask)?;
         let xs = (residual + xs)?;
         let residual = &xs;
-        let xs = xs.apply(&self.layer_norm2)?.apply(&self.mlp)?;
+        let xs = self.layer_norm2.forward(&xs, None)?;
+        let xs = self.mlp.forward(&xs)?;
         let xs = (xs + residual)?;
         Ok(xs)
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 struct Encoder {
     layers: Vec<EncoderLayer>,
 }
 
 impl Encoder {
-    fn new<C: TransformerConfig>(cfg: &C, vb: VarBuilder) -> Result<Self> {
+    fn new(config: &SiglipTextConfig, vb: VarBuilder) -> Result<Self> {
         let mut layers = vec![];
         let vb = vb.pp("layers");
-        for layer_idx in 0..cfg.num_hidden_layers() {
-            let layer = EncoderLayer::new(cfg, vb.pp(layer_idx))?;
+        for layer_idx in 0..config.num_hidden_layers {
+            let layer = EncoderLayer::new(config, vb.pp(layer_idx))?;
             layers.push(layer)
         }
         Ok(Self { layers })
@@ -254,9 +264,9 @@ impl Encoder {
 
 pub struct SiglipTextModel {
     embeddings: SiglipTextEmbeddings,
-    //encoder: SiglipTextEncoder,
-    //final_layer_norm: LayerNorm,
-    //pub head: Linear,
+    encoder: Encoder,
+    final_layer_norm: LayerNorm,
+    pub head: Linear,
     num_attention_heads: usize,
     pool: Pool,
     device: Device,
@@ -273,8 +283,31 @@ impl SiglipTextModel {
             ModelType::Embedding(pool) => pool,
         };
         let embeddings = SiglipTextEmbeddings::new(config, vb.pp("embeddings"))?;
+        let encoder = Encoder::new(config, vb.pp("encoder"))?;
+        let final_layer_norm = LayerNorm::load(
+            vb.pp("final_layer_norm"),
+            config.hidden_size,
+            config.layer_norm_eps as f32,
+        )?;
+
+        let head_weight = vb.pp("head").get((config.hidden_size, config.hidden_size), "weight")?;
+        let head_bias = vb.pp("head").get(config.hidden_size, "bias")?;
+        let head = Linear::new(head_weight, Some(head_bias), None);
+
+        /*
+        let final_layer_norm = layer_norm(
+            config.hidden_size,
+            config.layer_norm_eps,
+            vb.pp("final_layer_norm"),
+        )?;
+        */
+        //let head = linear(config.hidden_size, config.hidden_size, vb.pp("head"))?;
+
         Ok(Self {
-            embeddings: embeddings,
+            embeddings,
+            encoder,
+            final_layer_norm,
+            head,
             num_attention_heads: config.num_attention_heads,
             pool: pool,
             device: vb.device().clone(),
@@ -287,6 +320,7 @@ impl SiglipTextModel {
         let max_length = batch.max_length as usize;
         let shape = (batch_size, max_length);
 
+        // TODO
         println!(
             "SiglipTextModel::forward batch_size: {}, max_length: {}",
             batch_size, max_length
@@ -392,30 +426,39 @@ impl SiglipTextModel {
             };
 
         let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
-        let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
-        let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
-        let mut input_lengths =
-            Tensor::from_vec(input_lengths, (batch_size, 1), &self.device)?.to_dtype(self.dtype)?;
+        //let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
+        //let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
 
         let input_ids = self.embeddings.forward(&input_ids)?;
         println!("embeddings: {:?}", input_ids);
-        //let input_ids =
+        // TODO: attention mask
+        let input_ids = self.encoder.forward(&input_ids, None)?;
+        let last_hidden_state = self.final_layer_norm.forward(&input_ids, None)?;
 
-        /*/
-            let (_bsz, seq_len) = input_ids.dims2()?;
-            let input_ids = self.embeddings.forward(input_ids)?;
-            let input_ids = self.encoder.forward(&input_ids, None)?;
-            let last_hidden_state = self.final_layer_norm.forward(&input_ids)?;
-            last_hidden_state
-                .i((.., seq_len - 1, ..))?
-                .contiguous()?
-                .apply(&self.head)
-        }
-        */
+        let has_pooling_requests = !batch.pooled_indices.is_empty();
+        let has_raw_requests = !batch.raw_indices.is_empty();
 
-        //let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
-        let dummy_embedding = Tensor::zeros(shape, self.dtype, &self.device)?;
-        return Ok((Some(dummy_embedding), None));
+        let pooled_embeddings = if has_pooling_requests {
+            let mut results = Vec::new();
+            for &i in &batch.pooled_indices {
+                let i = i as usize;
+                let length = input_lengths[i] as usize;
+                results.push(last_hidden_state.i((i, length - 1))?.unsqueeze(0)?);
+            }
+            let pooled_tokens = Tensor::cat(&results, 0)?;
+            let projected_embeddings = self.head.forward(&pooled_tokens)?;
+            Some(projected_embeddings)
+        } else {
+            None
+        };
+
+        let raw_embeddings = if has_raw_requests {
+            Some(last_hidden_state)
+        } else {
+            None
+        };
+
+        return Ok((pooled_embeddings, raw_embeddings));
     }
 }
 
