@@ -1,10 +1,9 @@
-use crate::layers::{get_cublas_lt_wrapper, HiddenAct, LayerNorm, Linear};
+use crate::layers::{HiddenAct, LayerNorm, Linear};
 use crate::models::Model;
-use candle::{DType, Device, IndexOp, Module, Result, Tensor, D};
+use candle::{Device, IndexOp, Module, Result, Tensor, D};
 use candle_nn::{Embedding, VarBuilder};
 use serde::Deserialize;
-use std::collections::HashMap;
-use text_embeddings_backend_core::{Batch, ModelType, Pool};
+use text_embeddings_backend_core::{Batch, ModelType};
 
 // To be compatible with the original google repository
 // handle the full config but we only care about the text part
@@ -54,7 +53,6 @@ fn default_text_eos_token_id() -> u32 {
 }
 
 fn default_text_hidden_act() -> HiddenAct {
-    // TEI version of GeluPytorchTanh
     HiddenAct::Gelu
 }
 
@@ -267,21 +265,19 @@ pub struct SiglipTextModel {
     encoder: Encoder,
     final_layer_norm: LayerNorm,
     pub head: Linear,
-    num_attention_heads: usize,
-    pool: Pool,
+    max_position_embeddings: usize,
+    pad_token_id: u32,
     device: Device,
-    dtype: DType,
-    //span: tracing::Span,
 }
 
 impl SiglipTextModel {
     pub fn load(vb: VarBuilder, config: &SiglipTextConfig, model_type: ModelType) -> Result<Self> {
-        let pool = match model_type {
-            ModelType::Classifier => {
-                candle::bail!("SiglipTextModel only supports embedding mode")
-            }
-            ModelType::Embedding(pool) => pool,
-        };
+        // SigLIP always pools the final position and applies the projection head;
+        // the configured pooling mode is irrelevant, but classification is unsupported.
+        if let ModelType::Classifier = model_type {
+            candle::bail!("SiglipTextModel only supports embedding mode")
+        }
+
         let embeddings = SiglipTextEmbeddings::new(config, vb.pp("embeddings"))?;
         let encoder = Encoder::new(config, vb.pp("encoder"))?;
         let final_layer_norm = LayerNorm::load(
@@ -290,193 +286,106 @@ impl SiglipTextModel {
             config.layer_norm_eps as f32,
         )?;
 
-        let head_weight = vb.pp("head").get((config.hidden_size, config.hidden_size), "weight")?;
+        let head_weight = vb
+            .pp("head")
+            .get((config.hidden_size, config.hidden_size), "weight")?;
         let head_bias = vb.pp("head").get(config.hidden_size, "bias")?;
         let head = Linear::new(head_weight, Some(head_bias), None);
-
-        /*
-        let final_layer_norm = layer_norm(
-            config.hidden_size,
-            config.layer_norm_eps,
-            vb.pp("final_layer_norm"),
-        )?;
-        */
-        //let head = linear(config.hidden_size, config.hidden_size, vb.pp("head"))?;
 
         Ok(Self {
             embeddings,
             encoder,
             final_layer_norm,
             head,
-            num_attention_heads: config.num_attention_heads,
-            pool: pool,
+            max_position_embeddings: config.max_position_embeddings,
+            pad_token_id: config.pad_token_id,
             device: vb.device().clone(),
-            dtype: vb.dtype(),
         })
     }
 
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let batch_size = batch.len();
-        let max_length = batch.max_length as usize;
-        let shape = (batch_size, max_length);
+        // SigLIP is trained with inputs padded to a fixed length (`max_position_embeddings`,
+        // 64) and *no* attention mask: it attends to every position, including padding.
+        // Pooling then takes the final position (a sticky </s>/pad token), so the padded
+        // width must be exactly 64 for the position embedding at index 63 to be correct.
+        let padded_len = self.max_position_embeddings;
 
-        // TODO
-        println!(
-            "SiglipTextModel::forward batch_size: {}, max_length: {}",
-            batch_size, max_length
-        );
-        println!("batch input ids: {:?}", batch.input_ids);
-        println!("batch token type ids: {:?}", batch.token_type_ids);
-        println!("batch position ids: {:?}", batch.position_ids);
-        println!("batch: {:?}", batch);
+        let mut input_ids = Vec::with_capacity(batch_size * padded_len);
+        for i in 0..batch_size {
+            let start = batch.cumulative_seq_lengths[i] as usize;
+            let end = batch.cumulative_seq_lengths[i + 1] as usize;
 
-        let (input_ids, type_ids, position_ids, input_lengths, attention_bias, attention_mask) =
-            if batch_size > 1 {
-                // padded batch
-                let elems = batch_size * max_length;
-                let mut input_ids = Vec::with_capacity(elems);
-                let mut type_ids = Vec::with_capacity(elems);
-                let mut position_ids = Vec::with_capacity(elems);
-                let mut attention_mask = Vec::with_capacity(elems);
-                let mut attention_bias = Vec::with_capacity(elems);
-                let mut input_lengths = Vec::with_capacity(batch_size);
-                let mut masking = false;
+            for j in start..end {
+                input_ids.push(batch.input_ids[j]);
+            }
+            // Pad up to `padded_len` with the pad token (the sticky </s>).
+            for _ in (end - start)..padded_len {
+                input_ids.push(self.pad_token_id);
+            }
+        }
 
-                for i in 0..batch_size {
-                    let start = batch.cumulative_seq_lengths[i] as usize;
-                    let end = batch.cumulative_seq_lengths[i + 1] as usize;
-                    let seq_length = (end - start) as u32;
-                    input_lengths.push(seq_length as f32);
+        let input_ids = Tensor::from_vec(input_ids, (batch_size, padded_len), &self.device)?;
 
-                    for j in start..end {
-                        input_ids.push(batch.input_ids[j]);
-                        type_ids.push(batch.token_type_ids[j]);
-                        position_ids.push(batch.position_ids[j]);
-                        attention_mask.push(1.0_f32);
-                        attention_bias.push(0.0);
-                    }
-
-                    let padding = batch.max_length - seq_length;
-                    if padding > 0 {
-                        masking = true;
-                        for _ in 0..padding {
-                            input_ids.push(0);
-                            type_ids.push(0);
-                            position_ids.push(0);
-                            attention_mask.push(0.0_f32);
-                            attention_bias.push(f32::NEG_INFINITY);
-                        }
-                    }
-                }
-
-                let (attention_bias, attention_mask) = match masking {
-                    true => {
-                        // We only need the mask if we use mean pooling
-                        // For CLS pooling, the bias is enough
-                        let attention_mask = if self.pool == Pool::Mean {
-                            let attention_mask = Tensor::from_vec(
-                                attention_mask,
-                                (batch_size, max_length, 1),
-                                &self.device,
-                            )?
-                            .to_dtype(self.dtype)?;
-
-                            Some(attention_mask)
-                        } else {
-                            None
-                        };
-
-                        let attention_bias = Tensor::from_vec(
-                            attention_bias,
-                            (batch_size, 1, 1, max_length),
-                            &self.device,
-                        )?
-                        .to_dtype(self.dtype)?;
-                        // Broadcast once instead of at every layer
-                        let attention_bias = attention_bias
-                            .broadcast_as((
-                                batch_size,
-                                self.num_attention_heads,
-                                max_length,
-                                max_length,
-                            ))?
-                            .contiguous()?;
-                        (Some(attention_bias), attention_mask)
-                    }
-                    false => (None, None),
-                };
-
-                (
-                    input_ids,
-                    type_ids,
-                    position_ids,
-                    input_lengths,
-                    attention_bias,
-                    attention_mask,
-                )
-            } else {
-                (
-                    batch.input_ids,
-                    batch.token_type_ids,
-                    batch.position_ids,
-                    vec![batch.max_length as f32],
-                    None,
-                    None,
-                )
-            };
-
-        let input_ids = Tensor::from_vec(input_ids, shape, &self.device)?;
-        //let type_ids = Tensor::from_vec(type_ids, shape, &self.device)?;
-        //let position_ids = Tensor::from_vec(position_ids, shape, &self.device)?;
-
-        let input_ids = self.embeddings.forward(&input_ids)?;
-        println!("embeddings: {:?}", input_ids);
-        // TODO: attention mask
-        let input_ids = self.encoder.forward(&input_ids, None)?;
-        let last_hidden_state = self.final_layer_norm.forward(&input_ids, None)?;
+        let embedding_output = self.embeddings.forward(&input_ids)?;
+        // No attention mask: SigLIP attends to all positions.
+        let encoder_output = self.encoder.forward(&embedding_output, None)?;
+        let last_hidden_state = self.final_layer_norm.forward(&encoder_output, None)?;
 
         let has_pooling_requests = !batch.pooled_indices.is_empty();
         let has_raw_requests = !batch.raw_indices.is_empty();
 
         let pooled_embeddings = if has_pooling_requests {
-            let mut results = Vec::new();
+            // Pool the final position (index 63 under pad-to-64), then project with the head.
+            let mut results = Vec::with_capacity(batch.pooled_indices.len());
             for &i in &batch.pooled_indices {
-                let i = i as usize;
-                let length = input_lengths[i] as usize;
-                results.push(last_hidden_state.i((i, length - 1))?.unsqueeze(0)?);
+                results.push(
+                    last_hidden_state
+                        .i((i as usize, padded_len - 1))?
+                        .unsqueeze(0)?,
+                );
             }
             let pooled_tokens = Tensor::cat(&results, 0)?;
-            let projected_embeddings = self.head.forward(&pooled_tokens)?;
-            Some(projected_embeddings)
+            Some(self.head.forward(&pooled_tokens)?)
         } else {
             None
         };
 
         let raw_embeddings = if has_raw_requests {
-            Some(last_hidden_state)
+            // Flatten and drop padding tokens so the backend can slice by real seq length.
+            let (b, l, h) = last_hidden_state.shape().dims3()?;
+            let outputs = last_hidden_state.reshape((b * l, h))?;
+
+            let mut final_indices: Vec<u32> = Vec::new();
+            for &i in &batch.raw_indices {
+                let i = i as usize;
+                let start = i * padded_len;
+                let length = (batch.cumulative_seq_lengths[i + 1]
+                    - batch.cumulative_seq_lengths[i]) as usize;
+                for j in start..start + length {
+                    final_indices.push(j as u32);
+                }
+            }
+
+            let n = final_indices.len();
+            let final_indices = Tensor::from_vec(final_indices, n, &self.device)?;
+            Some(outputs.index_select(&final_indices, 0)?)
         } else {
             None
         };
 
-        return Ok((pooled_embeddings, raw_embeddings));
+        Ok((pooled_embeddings, raw_embeddings))
     }
 }
 
 impl Model for SiglipTextModel {
     fn is_padded(&self) -> bool {
         true
-        //false
     }
 
     fn embed(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         self.forward(batch)
     }
-
-    /*
-    fn predict(&self, batch: Batch) -> Result<Tensor> {
-        candle::bail!("`predict` is not implemented for this model")
-    }
-    */
 }
 
 #[derive(Debug, Clone)]
