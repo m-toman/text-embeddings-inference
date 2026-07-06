@@ -360,8 +360,8 @@ impl SiglipTextModel {
             for &i in &batch.raw_indices {
                 let i = i as usize;
                 let start = i * padded_len;
-                let length = (batch.cumulative_seq_lengths[i + 1]
-                    - batch.cumulative_seq_lengths[i]) as usize;
+                let length = (batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i])
+                    as usize;
                 for j in start..start + length {
                     final_indices.push(j as u32);
                 }
