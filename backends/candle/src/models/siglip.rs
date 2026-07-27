@@ -187,7 +187,7 @@ impl Mlp {
 
 impl Module for Mlp {
     fn forward(&self, xs: &candle::Tensor) -> Result<candle::Tensor> {
-        let xs = self.fc1.forward(&xs)?;
+        let xs = self.fc1.forward(xs)?;
         let xs = self.activation_fn.forward(&xs)?;
         let xs = self.fc2.forward(&xs)?;
         Ok(xs)
@@ -224,7 +224,7 @@ impl EncoderLayer {
 
     fn forward(&self, xs: &Tensor, attention_mask: Option<&Tensor>) -> Result<Tensor> {
         let residual = xs;
-        let xs = self.layer_norm1.forward(&xs, None)?;
+        let xs = self.layer_norm1.forward(xs, None)?;
         let xs = self.self_attn.forward(&xs, attention_mask)?;
         let xs = (residual + xs)?;
         let residual = &xs;
