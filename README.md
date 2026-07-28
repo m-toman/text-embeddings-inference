@@ -68,7 +68,8 @@ Ember, GTE and E5. TEI implements many features such as:
 #### Text Embeddings
 
 Text Embeddings Inference currently supports Nomic, BERT, CamemBERT, XLM-RoBERTa models with absolute positions, JinaBERT
-model with Alibi positions and Mistral, Alibaba GTE, Qwen2 models with Rope positions, MPNet, ModernBERT, Qwen3, and Gemma3.
+model with Alibi positions and Mistral, Alibaba GTE, Qwen2 models with Rope positions, MPNet, ModernBERT, Qwen3, Gemma3, and
+the SigLIP and SigLIP2 text encoders.
 
 Below are some examples of the currently supported models:
 
@@ -94,6 +95,11 @@ Below are some examples of the currently supported models:
 | N/A       | 340M                   | Qwen3          | [voyageai/voyage-4-nano](https://hf.co/voyageai/voyage-4-nano)                                   |
 | N/A       | 137M                   | JinaBERT       | [jinaai/jina-embeddings-v2-base-en](https://hf.co/jinaai/jina-embeddings-v2-base-en)             |
 | N/A       | 137M                   | JinaBERT       | [jinaai/jina-embeddings-v2-base-code](https://hf.co/jinaai/jina-embeddings-v2-base-code)         |
+| N/A       | 109M–1B                | SigLIP / SigLIP2 | [Veritone/siglip-models](https://hf.co/collections/Veritone/siglip-models) (collection)         |
+
+**Note**: The [Veritone SigLIP models](https://hf.co/collections/Veritone/siglip-models) collection mirrors the SigLIP and
+SigLIP2 **text encoders** (base through so400m) as standalone checkpoints ready to use with TEI. Only the text tower is
+served for embeddings; the vision checkpoints in the collection are not supported.
 
 To explore the list of best performing text embeddings models, visit the
 [Massive Text Embedding Benchmark (MTEB) Leaderboard](https://huggingface.co/spaces/mteb/leaderboard).
