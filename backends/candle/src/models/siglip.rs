@@ -306,8 +306,8 @@ impl SiglipTextModel {
     pub fn forward(&self, batch: Batch) -> Result<(Option<Tensor>, Option<Tensor>)> {
         let batch_size = batch.len();
         // SigLIP is trained with inputs padded to a fixed length (`max_position_embeddings`,
-        // 64) and *no* attention mask: it attends to every position, including padding.
-        // Pooling then takes the final position (a sticky </s>/pad token), so the padded
+        // 64) and no attention mask: it attends to every position, including padding.
+        // Pooling then takes the final position (</s>/pad token), so the padded
         // width must be exactly 64 for the position embedding at index 63 to be correct.
         let padded_len = self.max_position_embeddings;
 
@@ -315,12 +315,17 @@ impl SiglipTextModel {
         for i in 0..batch_size {
             let start = batch.cumulative_seq_lengths[i] as usize;
             let end = batch.cumulative_seq_lengths[i + 1] as usize;
+            // SigLIP operates on a fixed `padded_len` (64) token window. Truncate any longer
+            // input to that width: an over-long sequence would otherwise leave the flattened
+            // `input_ids` the wrong size and make the `Tensor::from_vec` reshape below fail with
+            // a shape mismatch, taking down every request dynamically batched alongside it.
+            let seq_len = (end - start).min(padded_len);
 
-            for j in start..end {
+            for j in start..start + seq_len {
                 input_ids.push(batch.input_ids[j]);
             }
-            // Pad up to `padded_len` with the pad token (the sticky </s>).
-            for _ in (end - start)..padded_len {
+            // Pad up to `padded_len` with pad token </s>.
+            for _ in seq_len..padded_len {
                 input_ids.push(self.pad_token_id);
             }
         }
@@ -360,8 +365,12 @@ impl SiglipTextModel {
             for &i in &batch.raw_indices {
                 let i = i as usize;
                 let start = i * padded_len;
-                let length = (batch.cumulative_seq_lengths[i + 1] - batch.cumulative_seq_lengths[i])
-                    as usize;
+                // Clamp to the padded width; longer sequences are truncated to `padded_len`
+                // above, so reading their full original length would run past the row and pull
+                // in the next sequence's tokens (or index out of bounds on the last row).
+                let length = ((batch.cumulative_seq_lengths[i + 1]
+                    - batch.cumulative_seq_lengths[i]) as usize)
+                    .min(padded_len);
                 for j in start..start + length {
                     final_indices.push(j as u32);
                 }

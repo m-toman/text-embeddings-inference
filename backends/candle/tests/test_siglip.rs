@@ -105,3 +105,46 @@ fn test_siglip_classifier_unsupported() -> Result<()> {
 
     Ok(())
 }
+
+#[test]
+#[serial_test::serial]
+fn test_siglip_long_input_truncated() -> Result<()> {
+    let (model_root, _) = download_artifacts("google/siglip-base-patch16-224", None, None)?;
+    let tokenizer = load_tokenizer(&model_root)?;
+
+    let backend = CandleBackend::new(
+        &model_root,
+        "float32".to_string(),
+        ModelType::Embedding(Pool::Mean),
+        None,
+    )?;
+
+    // An input longer than the fixed 64-token window must be truncated inside the model
+    // rather than error out. Batch it with a short input to assert the over-long sequence
+    // does not poison the rest of the batch (previously the reshape failed for the whole
+    // batch with a shape mismatch).
+    let long_text = "What is Deep Learning? ".repeat(30);
+    let long_encoding = tokenizer.encode(long_text.as_str(), true).unwrap();
+    assert!(
+        long_encoding.len() > 64,
+        "test input should exceed the 64-token window; got {}",
+        long_encoding.len()
+    );
+
+    let input_batch = batch(
+        vec![
+            tokenizer.encode("What is Deep Learning?", true).unwrap(),
+            long_encoding,
+        ],
+        [0, 1].to_vec(),
+        vec![],
+    );
+
+    let (pooled_embeddings, _) = sort_embeddings(backend.embed(input_batch)?);
+    assert_eq!(pooled_embeddings.len(), 2);
+    for embedding in &pooled_embeddings {
+        assert_eq!(embedding.len(), 768);
+    }
+
+    Ok(())
+}
