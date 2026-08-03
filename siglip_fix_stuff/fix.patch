@@ -1,0 +1,80 @@
+diff --git a/backends/candle/src/lib.rs b/backends/candle/src/lib.rs
+index 7f6df9d..2ed667a 100644
+--- a/backends/candle/src/lib.rs
++++ b/backends/candle/src/lib.rs
+@@ -155,6 +155,48 @@ enum Config {
+     Siglip(SiglipConfig),
+ }
+ 
++/// Resolve the tokenizer's pad token id from the tokenizer files in `model_path`.
++///
++/// Tries, in order:
++/// 1. the explicit `padding.pad_id` in `tokenizer.json` (present when the checkpoint
++///    ships a padding strategy, e.g. the SigLIP2 fixed-to-64 padding);
++/// 2. the `pad_token` declared in `tokenizer_config.json` (plain string or
++///    `AddedToken`-style object), mapped to its id via the `added_tokens` section of
++///    `tokenizer.json`.
++///
++/// Returns `None` if neither source is available, in which case callers should keep
++/// the id from `config.json`.
++fn resolve_siglip_pad_token_id(model_path: &Path) -> Option<u32> {
++    let tokenizer: serde_json::Value =
++        serde_json::from_str(&std::fs::read_to_string(model_path.join("tokenizer.json")).ok()?)
++            .ok()?;
++
++    if let Some(pad_id) = tokenizer
++        .get("padding")
++        .and_then(|p| p.get("pad_id"))
++        .and_then(|v| v.as_u64())
++    {
++        return Some(pad_id as u32);
++    }
++
++    let tokenizer_config: serde_json::Value = serde_json::from_str(
++        &std::fs::read_to_string(model_path.join("tokenizer_config.json")).ok()?,
++    )
++    .ok()?;
++    let pad_token = tokenizer_config.get("pad_token")?;
++    let pad_token = pad_token
++        .as_str()
++        .or_else(|| pad_token.get("content").and_then(|v| v.as_str()))?;
++
++    tokenizer
++        .get("added_tokens")?
++        .as_array()?
++        .iter()
++        .find(|token| token.get("content").and_then(|v| v.as_str()) == Some(pad_token))
++        .and_then(|token| token.get("id").and_then(|v| v.as_u64()))
++        .map(|id| id as u32)
++}
++
+ pub struct CandleBackend {
+     device: Device,
+     model: Box<dyn Model + Send>,
+@@ -377,8 +419,25 @@ impl CandleBackend {
+                     Ok(Box::new(Pplx1Model::load(vb, &config, model_type).s()?))
+                 }
+             }
+-            (Config::Siglip(config), _) => {
++            (Config::Siglip(mut config), _) => {
+                 tracing::info!("Starting SigLIP model on {:?}", device);
++                // SigLIP attends to padding (no attention mask) and pools the final —
++                // padding — position, so padding with the wrong token corrupts the
++                // embeddings. `config.json` carries no `pad_token_id` for the
++                // google/siglip* checkpoints and the transformers default (1) is only
++                // correct for the SigLIP v1 tokenizer (`</s>` = 1); SigLIP2 uses the
++                // Gemma tokenizer, which pads with `<pad>` = 0. Resolve the real pad
++                // token id from the tokenizer files instead.
++                if let Some(pad_token_id) = resolve_siglip_pad_token_id(model_path) {
++                    if pad_token_id != config.text_config.pad_token_id {
++                        tracing::warn!(
++                            "Overriding SigLIP `pad_token_id` from `config.json` ({}) with the tokenizer's pad token id ({})",
++                            config.text_config.pad_token_id,
++                            pad_token_id
++                        );
++                        config.text_config.pad_token_id = pad_token_id;
++                    }
++                }
+                 Ok(Box::new(
+                     SiglipTextModel::load(vb.pp("text_model"), &config.text_config, model_type)
+                         .s()?,
