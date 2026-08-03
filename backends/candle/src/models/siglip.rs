@@ -40,17 +40,6 @@ fn default_text_layer_norm_eps() -> f64 {
     1e-6
 }
 
-fn default_text_pad_token_id() -> u32 {
-    1
-}
-
-fn default_text_bos_token_id() -> u32 {
-    49406
-}
-
-fn default_text_eos_token_id() -> u32 {
-    49407
-}
 
 fn default_text_hidden_act() -> HiddenAct {
     HiddenAct::Gelu
@@ -73,12 +62,7 @@ pub struct SiglipTextConfig {
     pub max_position_embeddings: usize,
     #[serde(default = "default_text_layer_norm_eps")]
     pub layer_norm_eps: f64,
-    #[serde(default = "default_text_pad_token_id")]
     pub pad_token_id: u32,
-    #[serde(default = "default_text_bos_token_id")]
-    pub bos_token_id: u32,
-    #[serde(default = "default_text_eos_token_id")]
-    pub eos_token_id: u32,
     #[serde(default = "default_text_hidden_act")]
     pub hidden_act: HiddenAct,
 }
